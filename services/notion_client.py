@@ -291,3 +291,4 @@ class NotionTaskBoard:
 
 # Singleton
 notion = NotionTaskBoard()
+
