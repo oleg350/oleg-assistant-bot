@@ -91,14 +91,13 @@ def _fmt_task_table(tasks: list[dict], show_project: bool = False) -> str:
         prio = PRIORITY_LABEL.get(t.get("priority", ""), "")
         dl = _fmt_deadline_short(t.get("deadline"))
         title = t["title"][:42]
-        parts = [f"  {i}. {title}"]
+        prefix = f"{prio} " if prio else "   "
+        parts = [f"{prefix}{i}. {title}"]
         if show_project:
             proj = (t.get("project") or "")[:12]
             parts.append(f"[{proj}]")
         if dl:
             parts.append(dl)
-        if prio:
-            parts.append(prio)
         lines.append("  ".join(parts))
     return "\n".join(lines)
 
