@@ -1,11 +1,11 @@
 """
-Notion integration â manages tasks board and metrics database.
+Notion integration — manages tasks board and metrics database.
 
 Expected Notion databases:
 
 TASKS DB properties:
   - Name (title)
-  - Status (select: "ÐÐ¾Ð²Ð°Ñ", "Ð ÑÐ°Ð±Ð¾ÑÐµ", "ÐÐ¾ÑÐ¾Ð²Ð¾", "ÐÐ°Ð±Ð»Ð¾ÐºÐ¸ÑÐ¾Ð²Ð°Ð½Ð°")
+  - Status (select: "Новая", "В работе", "Готово", "Заблокирована")
   - Priority (select: "high", "medium", "low")
   - Project (select)
   - Deadline (date)
@@ -14,7 +14,7 @@ TASKS DB properties:
   - Created (date, auto)
 
 METRICS DB properties:
-  - Name (title) â metric name
+  - Name (title) — metric name
   - Project (select)
   - Value (number)
   - Unit (rich_text)
@@ -44,15 +44,15 @@ class NotionTaskBoard:
         self.db_id = config.NOTION_DATABASE_ID
         self.metrics_db_id = config.NOTION_METRICS_DB_ID
 
-    # ââ Tasks âââââââââââââââââââââââââââââââââââââââââââââââââ
+    # ── Tasks ─────────────────────────────────────────────────
 
     async def create_task(self, task: dict) -> dict:
         """Create a new task page in the Notion database."""
         properties = {
             "Name": {"title": [{"text": {"content": task["title"]}}]},
-            "Status": {"select": {"name": "ÐÐ¾Ð²Ð°Ñ"}},
+            "Status": {"select": {"name": "Новая"}},
             "Priority": {"select": {"name": task.get("priority", "medium")}},
-            "Project": {"select": {"name": task.get("project", "ÐÐ±ÑÐµÐµ")}},
+            "Project": {"select": {"name": task.get("project", "Общее")}},
         }
 
         if task.get("deadline"):
@@ -142,7 +142,7 @@ class NotionTaskBoard:
                     {"property": "Deadline", "date": {"before": today}},
                     {
                         "property": "Status",
-                        "select": {"does_not_equal": "ÐÐ¾ÑÐ¾Ð²Ð¾"},
+                        "select": {"does_not_equal": "Готово"},
                     },
                 ]
             },
@@ -173,7 +173,7 @@ class NotionTaskBoard:
                 "and": [
                     {"property": "Deadline", "date": {"on_or_after": today_str}},
                     {"property": "Deadline", "date": {"on_or_before": future}},
-                    {"property": "Status", "select": {"does_not_equal": "ÐÐ¾ÑÐ¾Ð²Ð¾"}},
+                    {"property": "Status", "select": {"does_not_equal": "Готово"}},
                 ]
             },
             "sorts": [{"property": "Deadline", "direction": "ascending"}],
@@ -190,13 +190,13 @@ class NotionTaskBoard:
 
         return [self._parse_page(p) for p in pages]
 
-    # ââ Metrics âââââââââââââââââââââââââââââââââââââââââââââââ
+    # ── Metrics ───────────────────────────────────────────────
 
     async def add_metric(self, metric: dict) -> dict:
         """Add a metric entry to the metrics database."""
         properties = {
             "Name": {"title": [{"text": {"content": metric["metric_name"]}}]},
-            "Project": {"select": {"name": metric.get("project", "ÐÐ±ÑÐµÐµ")}},
+            "Project": {"select": {"name": metric.get("project", "Общее")}},
             "Value": {"number": float(metric.get("value", 0))},
             "Date": {"date": {"start": datetime.now().date().isoformat()}},
         }
@@ -249,7 +249,197 @@ class NotionTaskBoard:
             })
         return metrics
 
-    # ââ Helpers ââââââââââââââââââââââââââââââââââââââââââââââââ
+    # ── Projects ──────────────────────────────────────────────
+
+    async def get_projects(self) -> list[str]:
+        """Get a list of unique project names from tasks DB."""
+        tasks = await self.get_all_tasks()
+        projects = set()
+        for t in tasks:
+            if t["project"]:
+                projects.add(t["project"])
+        return sorted(projects)
+
+    async def rename_project(self, old_name: str, new_name: str) -> int:
+        """Rename a project across all tasks. Returns count of updated tasks."""
+        tasks = await self.get_all_tasks()
+        matching = [t for t in tasks if t["project"].lower() == old_name.lower()]
+
+        count = 0
+        async with httpx.AsyncClient() as client:
+            for t in matching:
+                body = {"properties": {"Project": {"select": {"name": new_name}}}}
+                try:
+                    resp = await client.patch(
+                        f"{NOTION_API}/pages/{t['id']}",
+                        headers=HEADERS,
+                        json=body,
+                        timeout=30,
+                    )
+                    resp.raise_for_status()
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Failed to rename project for task {t['id']}: {e}")
+        logger.info(f"Renamed project '{old_name}' -> '{new_name}' in {count} tasks")
+        return count
+
+    async def get_tasks_by_project(self, project_name: str) -> list[dict]:
+        """Get all tasks for a specific project."""
+        body = {
+            "filter": {
+                "property": "Project",
+                "select": {"equals": project_name},
+            },
+            "sorts": [{"property": "Deadline", "direction": "ascending"}],
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{NOTION_API}/databases/{self.db_id}/query",
+                headers=HEADERS,
+                json=body,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            pages = resp.json()["results"]
+
+        return [self._parse_page(p) for p in pages]
+
+    # ── Subtasks (to-do blocks inside a task page) ──────────────
+
+    async def add_subtask(self, page_id: str, subtask_text: str) -> bool:
+        """Add a to-do item (subtask) as a block inside a task page."""
+        body = {
+            "children": [
+                {
+                    "object": "block",
+                    "type": "to_do",
+                    "to_do": {
+                        "rich_text": [{"text": {"content": subtask_text}}],
+                        "checked": False,
+                    },
+                }
+            ]
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(
+                f"{NOTION_API}/blocks/{page_id}/children",
+                headers=HEADERS,
+                json=body,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            logger.info(f"Added subtask to {page_id}: {subtask_text}")
+            return True
+
+    async def get_subtasks(self, page_id: str) -> list[dict]:
+        """Get all to-do blocks (subtasks) from a task page."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{NOTION_API}/blocks/{page_id}/children",
+                headers=HEADERS,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            blocks = resp.json()["results"]
+
+        subtasks = []
+        for b in blocks:
+            if b["type"] == "to_do":
+                text = "".join(
+                    t["text"]["content"] for t in b["to_do"]["rich_text"]
+                )
+                subtasks.append({
+                    "id": b["id"],
+                    "text": text,
+                    "checked": b["to_do"]["checked"],
+                })
+        return subtasks
+
+    # ── Task field updates ────────────────────────────────────
+
+    async def update_task_deadline(self, page_id: str, deadline: str) -> dict:
+        """Update task deadline."""
+        body = {"properties": {"Deadline": {"date": {"start": deadline}}}}
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(
+                f"{NOTION_API}/pages/{page_id}",
+                headers=HEADERS,
+                json=body,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def update_task_project(self, page_id: str, project: str) -> dict:
+        """Update task project."""
+        body = {"properties": {"Project": {"select": {"name": project}}}}
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(
+                f"{NOTION_API}/pages/{page_id}",
+                headers=HEADERS,
+                json=body,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def get_active_tasks_summary(self) -> str:
+        """Get a formatted summary of active tasks grouped by project for digest messages."""
+        tasks = await self.get_all_tasks()
+        active = [t for t in tasks if t["status"] != "Готово"]
+
+        if not active:
+            return "Все задачи выполнены!"
+
+        # Group by project
+        projects: dict[str, list] = {}
+        for t in active:
+            proj = t["project"] or "Общее"
+            projects.setdefault(proj, []).append(t)
+
+        overdue_count = 0
+        lines = []
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        priority_label = {"high": "!!!", "medium": "!!", "low": "!"}
+
+        for proj, proj_tasks in sorted(projects.items()):
+            proj_tasks.sort(key=lambda t: (
+                t.get("deadline") or "9999-99-99",
+                priority_order.get(t.get("priority", ""), 2),
+            ))
+            lines.append(f"\n<b>{proj}</b>")
+            for i, t in enumerate(proj_tasks, 1):
+                prio = priority_label.get(t["priority"], "")
+                dl = t.get("deadline") or ""
+                if dl:
+                    from datetime import date as d
+                    try:
+                        dl_date = datetime.fromisoformat(dl).date()
+                        delta = (dl_date - d.today()).days
+                        if delta < 0:
+                            dl_str = f"-{abs(delta)}д!"
+                            overdue_count += 1
+                        elif delta == 0:
+                            dl_str = "сегодня!"
+                        elif delta == 1:
+                            dl_str = "завтра"
+                        elif delta <= 7:
+                            dl_str = f"{delta}д"
+                        else:
+                            dl_str = dl_date.strftime("%d.%m")
+                    except ValueError:
+                        dl_str = dl
+                else:
+                    dl_str = "нет"
+                lines.append(f"  {i}. {t['title']}  {dl_str}  {prio}")
+
+        header = f"<b>Активные задачи — {len(active)}</b>"
+        if overdue_count:
+            header += f"\nПросрочено: {overdue_count}"
+
+        return header + "\n".join(lines)
+
+    # ── Helpers ────────────────────────────────────────────────
 
     def _parse_page(self, page: dict) -> dict:
         props = page["properties"]
