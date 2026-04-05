@@ -23,7 +23,7 @@ class Config:
     # Reminders
     REMINDER_CHECK_INTERVAL_MINUTES: int = int(os.getenv("REMINDER_CHECK_INTERVAL", "30"))
     DAILY_DIGEST_HOUR: int = int(os.getenv("DAILY_DIGEST_HOUR", "9"))  # 9 AM
-    TIMEZONE: str = os.getenv("TIMEZONE", "Europe/Moscow")
+    TIMEZONE: str = os.getenv("TIMEZONE", "America/Montevideo")
 
     def __post_init__(self):
         raw_ids = os.getenv("ALLOWED_USER_IDS", "")
