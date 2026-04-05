@@ -1,12 +1,11 @@
 """
-Scheduler — deadline reminders, daily digests, progress check-ins.
+Scheduler — deadline reminders, daily digests, task digests every 3 hours.
 Uses APScheduler with asyncio.
 """
 import logging
 from datetime import datetime
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
 from config import config
@@ -28,40 +27,36 @@ class ReminderScheduler:
     def start(self):
         """Register all jobs and start the scheduler."""
 
-        # 1. Check overdue tasks every N minutes
-        self.scheduler.add_job(
-            self._check_overdue,
-            IntervalTrigger(minutes=config.REMINDER_CHECK_INTERVAL_MINUTES),
-            id="check_overdue",
-            replace_existing=True,
-        )
-
-        # 2. Daily morning digest
+        # 1. Morning digest at 4:30 (Uruguay time)
         self.scheduler.add_job(
             self._daily_digest,
-            CronTrigger(hour=config.DAILY_DIGEST_HOUR, minute=0),
+            CronTrigger(hour=4, minute=30),
             id="daily_digest",
             replace_existing=True,
         )
 
-        # 3. Evening progress check-in (ask for metrics update)
+        # 2. Task digest every 3 hours from 7:30 to 19:30 (Uruguay)
+        # Hours: 7:30, 10:30, 13:30, 16:30, 19:30
+        self.scheduler.add_job(
+            self._task_digest,
+            CronTrigger(hour="7,10,13,16,19", minute=30),
+            id="task_digest_3h",
+            replace_existing=True,
+        )
+
+        # 3. Evening summary at 21:00
         self.scheduler.add_job(
             self._evening_checkin,
-            CronTrigger(hour=19, minute=0),
+            CronTrigger(hour=21, minute=0),
             id="evening_checkin",
             replace_existing=True,
         )
 
-        # 4. Upcoming deadlines alert (twice a day)
-        self.scheduler.add_job(
-            self._deadline_alert,
-            CronTrigger(hour="9,15", minute=30),
-            id="deadline_alert",
-            replace_existing=True,
-        )
-
         self.scheduler.start()
-        logger.info("Scheduler started with all jobs")
+        logger.info(
+            f"Scheduler started (TZ: {config.TIMEZONE}). "
+            f"Jobs: morning 4:30, digest 7:30/10:30/13:30/16:30/19:30, evening 21:00"
+        )
 
     async def _send_to_all(self, text: str):
         """Send message to all allowed users."""
@@ -73,28 +68,15 @@ class ReminderScheduler:
             except Exception as e:
                 logger.error(f"Failed to send to {user_id}: {e}")
 
-    async def _check_overdue(self):
-        """Check for overdue tasks and notify."""
+    async def _task_digest(self):
+        """Send task digest every 3 hours with active tasks grouped by project."""
         try:
-            overdue = await notion.get_overdue_tasks()
-            if not overdue:
-                return
-
-            lines = ["🔴 <b>Просроченные задачи:</b>\n"]
-            for t in overdue:
-                priority_emoji = {"high": "🔥", "medium": "⚡", "low": "📌"}.get(
-                    t["priority"], "📌"
-                )
-                deadline = t["deadline"] or "без срока"
-                lines.append(
-                    f"{priority_emoji} <b>{t['title']}</b>\n"
-                    f"   📁 {t['project']} | ⏰ {deadline}\n"
-                    f"   <a href='{t['url']}'>Открыть в Notion</a>"
-                )
-
-            await self._send_to_all("\n".join(lines))
+            summary = await notion.get_active_tasks_summary()
+            now = datetime.now(self.tz).strftime("%H:%M")
+            msg = f"<b>Задачи — {now}</b>\n\n{summary}"
+            await self._send_to_all(msg)
         except Exception as e:
-            logger.error(f"Overdue check failed: {e}")
+            logger.error(f"Task digest failed: {e}")
 
     async def _daily_digest(self):
         """Send morning daily digest."""
@@ -102,63 +84,53 @@ class ReminderScheduler:
             all_tasks = await notion.get_all_tasks()
             metrics = await notion.get_recent_metrics()
 
-            # Stats
             total = len(all_tasks)
             done = len([t for t in all_tasks if t["status"] == "Готово"])
             in_progress = len([t for t in all_tasks if t["status"] == "В работе"])
             blocked = len([t for t in all_tasks if t["status"] == "Заблокирована"])
-            new = len([t for t in all_tasks if t["status"] == "Новая"])
+            new_count = len([t for t in all_tasks if t["status"] == "Новая"])
 
-            # AI analysis
-            analysis = await analyze_progress(all_tasks, metrics)
+            overdue = await notion.get_overdue_tasks()
+            upcoming = await notion.get_upcoming_deadlines(days=3)
 
             msg = (
-                f"☀️ <b>Доброе утро! Дайджест на {datetime.now(self.tz).strftime('%d.%m.%Y')}</b>\n\n"
-                f"📊 <b>Задачи:</b> {total} всего\n"
-                f"   ✅ Готово: {done}\n"
-                f"   🔄 В работе: {in_progress}\n"
-                f"   🆕 Новых: {new}\n"
-                f"   🚫 Заблокировано: {blocked}\n\n"
-                f"🤖 <b>Анализ AI:</b>\n{analysis}"
+                f"<b>Доброе утро — {datetime.now(self.tz).strftime('%d.%m.%Y')}</b>\n\n"
+                f"<b>Задачи:</b> {total} всего\n"
+                f"  Новых: {new_count}\n"
+                f"  В работе: {in_progress}\n"
+                f"  Готово: {done}\n"
+                f"  Заблокировано: {blocked}\n"
             )
+
+            if overdue:
+                msg += f"\n<b>Просрочено: {len(overdue)}</b>\n"
+                for t in overdue[:5]:
+                    msg += f"  {t['title']}  ({t['project']})\n"
+
+            if upcoming:
+                msg += f"\n<b>Ближайшие дедлайны ({len(upcoming)}):</b>\n"
+                for t in upcoming[:5]:
+                    msg += f"  {t['title']} — {t['deadline']}\n"
+
+            msg += "\nПродуктивного дня!"
 
             await self._send_to_all(msg)
         except Exception as e:
             logger.error(f"Daily digest failed: {e}")
 
     async def _evening_checkin(self):
-        """Evening check-in: ask user for progress update."""
-        msg = (
-            "🌙 <b>Вечерний чек-ин</b>\n\n"
-            "Как прошёл день? Запиши голосовым:\n"
-            "• Какие задачи продвинулись?\n"
-            "• Есть обновления по цифрам/метрикам?\n"
-            "• Что заблокировано?\n\n"
-            "Я разберу и обновлю доску 📋"
-        )
-        await self._send_to_all(msg)
-
-    async def _deadline_alert(self):
-        """Alert about upcoming deadlines (next 3 days)."""
+        """Evening check-in: summary + ask for updates."""
         try:
-            upcoming = await notion.get_upcoming_deadlines(days=3)
-            if not upcoming:
-                return
-
-            lines = ["⏳ <b>Дедлайны в ближайшие 3 дня:</b>\n"]
-            for t in upcoming:
-                priority_emoji = {"high": "🔥", "medium": "⚡", "low": "📌"}.get(
-                    t["priority"], "📌"
-                )
-                lines.append(
-                    f"{priority_emoji} <b>{t['title']}</b> — {t['deadline']}\n"
-                    f"   📁 {t['project']} | {t['status']}\n"
-                    f"   <a href='{t['url']}'>Открыть</a>"
-                )
-
-            await self._send_to_all("\n".join(lines))
+            summary = await notion.get_active_tasks_summary()
+            msg = (
+                "<b>Вечерний итог</b>\n\n"
+                f"{summary}\n\n"
+                "Закрыл задачу? — /done\n"
+                "Есть обновления? — скажи голосовым."
+            )
+            await self._send_to_all(msg)
         except Exception as e:
-            logger.error(f"Deadline alert failed: {e}")
+            logger.error(f"Evening checkin failed: {e}")
 
     def stop(self):
         """Shutdown scheduler gracefully."""
