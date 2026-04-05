@@ -56,46 +56,50 @@ def is_allowed(user_id: int) -> bool:
 # ── Helpers ──────────────────────────────────────────────────────
 
 PRIORITY_ORDER = {"high": 0, "medium": 1, "low": 2, "": 3}
-PRIORITY_LABEL = {"high": "!!!", "medium": "!!", "low": "!"}
+PRIORITY_LABEL = {"high": "🔴", "medium": "🟡", "low": "🔵"}
 STATUS_LABEL = {"Новая": "new", "В работе": "wip", "Готово": "done", "Заблокирована": "block"}
 
 
 def _fmt_deadline_short(deadline_str: str | None) -> str:
     """Return a compact deadline string for table display."""
     if not deadline_str:
-        return "нет"
+        return ""
     try:
         dl = datetime.fromisoformat(deadline_str).date()
         today = date.today()
         delta = (dl - today).days
         if delta < 0:
-            return f"-{abs(delta)}д!"
+            return f"🔥 -{abs(delta)}д!"
         elif delta == 0:
-            return "сегодня!"
+            return "🔥 сегодня!"
         elif delta == 1:
-            return "завтра"
+            return "⏰ завтра"
         elif delta <= 7:
-            return f"{delta}д"
+            return f"⏰ {delta}д"
         else:
-            return dl.strftime("%d.%m")
+            return f"⏰ {dl.strftime('%d.%m')}"
     except (ValueError, TypeError):
         return str(deadline_str)
 
 
 def _fmt_task_table(tasks: list[dict], show_project: bool = False) -> str:
-    """Format tasks as a clean monospace table."""
+    """Format tasks as a readable list with emoji markers."""
     if not tasks:
         return "<i>Нет задач</i>"
     lines = []
     for i, t in enumerate(tasks, 1):
         prio = PRIORITY_LABEL.get(t.get("priority", ""), "")
         dl = _fmt_deadline_short(t.get("deadline"))
-        title = t["title"][:38]
+        title = t["title"][:42]
+        parts = [f"  {i}. {title}"]
         if show_project:
-            proj = (t.get("project") or "")[:10]
-            lines.append(f"  {i}. {title}  [{proj}]  {dl}  {prio}")
-        else:
-            lines.append(f"  {i}. {title}  {dl}  {prio}")
+            proj = (t.get("project") or "")[:12]
+            parts.append(f"[{proj}]")
+        if dl:
+            parts.append(dl)
+        if prio:
+            parts.append(prio)
+        lines.append("  ".join(parts))
     return "\n".join(lines)
 
 
@@ -190,11 +194,11 @@ async def cb_tasks_filter(callback: CallbackQuery):
         done_tasks = [t for t in tasks if t["status"] == "Готово"]
         if not done_tasks:
             return await callback.message.answer("Выполненных задач нет.")
-        lines = [f"<b>Выполненные задачи — {len(done_tasks)}</b>\n"]
+        lines = [f"✅ <b>Выполненные задачи — {len(done_tasks)}</b>\n"]
         for proj, proj_tasks in sorted(_group_by_project(done_tasks).items()):
-            lines.append(f"<b>{proj}</b>")
+            lines.append(f"📂 <b>{proj}</b>")
             for i, t in enumerate(proj_tasks, 1):
-                lines.append(f"  {i}. <s>{t['title']}</s>")
+                lines.append(f"  {i}. ✅ <s>{t['title']}</s>")
             lines.append("")
         await callback.message.answer("\n".join(lines), parse_mode="HTML")
     else:
@@ -212,10 +216,10 @@ async def _render_tasks(message: Message, tasks: list[dict], show_done: bool):
     if not active_total and not show_done:
         return await message.answer("Все задачи выполнены!")
 
-    lines = [f"<b>Задачи — {len(tasks)}</b>"]
+    lines = [f"📋 <b>Задачи — {len(tasks)}</b>"]
     if overdue_total:
-        lines.append(f"Просрочено: {overdue_total}")
-    lines.append("")
+        lines.append(f"🔥 Просрочено: {overdue_total}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
 
     for proj in sorted(all_projects.keys()):
         proj_tasks = all_projects[proj]
@@ -225,7 +229,7 @@ async def _render_tasks(message: Message, tasks: list[dict], show_done: bool):
         if not active and not show_done:
             continue
 
-        lines.append(f"<b>{proj}</b>")
+        lines.append(f"📂 <b>{proj}</b>")
 
         if active:
             sorted_active = _sort_tasks(active)
@@ -233,9 +237,9 @@ async def _render_tasks(message: Message, tasks: list[dict], show_done: bool):
 
         if done and show_done:
             for t in done:
-                lines.append(f"  <s>{t['title']}</s>")
+                lines.append(f"  ✅ <s>{t['title']}</s>")
         elif done and not show_done:
-            lines.append(f"  <i>+ {len(done)} выполн.</i>")
+            lines.append(f"  ✅ <i>+ {len(done)} выполн.</i>")
 
         lines.append("")
 
